@@ -15,6 +15,8 @@ import torchvision
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from botocore.exceptions import ClientError
 from torchvision import transforms
+from transformers import RobertaTokenizer, RobertaModel
+
 # If you want higher‑level S3 transfer helpers
 from boto3.s3.transfer import S3Transfer
 import albumentations as A
@@ -39,7 +41,7 @@ import pycocotools.mask as mask_util
 import matplotlib.pyplot as plt
 from torchvision.models.detection import maskrcnn_resnet50_fpn
 
-
+#TODO MaskRCNN training: train on aws,
 #TODO NEXT STEPS: CREATE INFERENCE FUNCTION FOR ITERATIVE GENERATIONS, CREATE TRAINING, think about encoder training, BPE/DCT
 #incorporate beam search inference?
 #check for start/padding/end tokens in CALVIN, 
@@ -79,8 +81,6 @@ class Encoder(nn.Module):
             out = layer(out, out, out, mask)
 
         return out
-        
-
 
 class Decoder(nn.Module):
     def __init__(self,trg_vocab_size,max_size, embed_size, dropout, heads,
@@ -135,18 +135,17 @@ class Transformer(nn.Module):
             heads = 8,
             dropout = 0,
             device="cpu",
-            max_length = 100
-
+            max_length = 5000
 
     ):
         super(Transformer,self).__init__()
 
         self.encoder = Encoder(
             src_vocab_size,
-            max_length,
-            embed_size=256,
+            1,
+            embed_size=1000,
             num_length=6,
-            heads=8,
+            heads=10,
             # Parameter 'device' from Transformer passed to Encoder's 'device'
   # Parameter 'forward_expansion' from Transformer passed to Encoder's 'forward_expansion'
            # Parameter 'dropout' from Transformer passed to Encoder's 'dropout'
@@ -158,9 +157,9 @@ class Transformer(nn.Module):
         self.decoder = Decoder(
             trg_vocab_size,
             max_size=100,
-            embed_size=256,
+            embed_size=5000,
             num_layers=6,
-            heads=8,
+            heads=10,
             forward_expansion=forward_expansion,
             dropout=0,
             device='cpu',
@@ -170,8 +169,29 @@ class Transformer(nn.Module):
         self.src_trg_pad_idx = trg_pad_idx
         self.device = 'cpu'
         #TODO add correct ignore index
+        #tokenization inits 
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+        self.tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+        self.token_model = RobertaModel.from_pretrained('roberta-base')
+        self.embedding_size = self.token_model.config.hidden_size
+        self.sep_token_id = self.tokenizer.convert_tokens_to_ids('</s>')
+        self.pretrained_sep_emb = self.token_model.embeddings.word_embeddings.weight[self.sep_token_id].unsqueeze(0).unsqueeze(0)  # shape (1,1,D)
+        self.sep_token = nn.Parameter(self.pretrained_sep_emb.clone())  # Initialize with pretrained
+        
+        self.imageProj = nn.Linear(1,self.embedding_size)
 
+
+    def MultiModalProjection(self,raw_text,raw_img):
+        tokenized_txt=self.tokenizer(raw_text,return_tensors='pt',padding=True, truncation=True)
+        print(f"keys:{tokenized_txt.keys()}")
+        #tokenized_txt['attention_mask']
+        text_output = self.token_model(**tokenized_txt)
+        cat_txt = text_output.last_hidden_state  # unpacks input_ids, attention_mask
+        cat_img = raw_img.unsqueeze(-1)
+        img_proj = self.imageProj(cat_img)
+        print(img_proj.shape,cat_txt.shape)
+        x = torch.cat([cat_txt,self.sep_token,img_proj],dim=1)
+        return x
 
     def make_src_mask(self,src):
         src_mask = (src!=self.src_pad_idx).unsqueeze(-1).unsqueeze(2)
@@ -309,6 +329,28 @@ def get_aws(keyy):
     data=resp['Body'].read()
     loaded = np.load(io.BytesIO(data),allow_pickle=True)
     print(f"successfully loaded {loaded}")
+        #*GULP*#
+    # sagemaker = boto3.client('sagemaker')
+    # sagemaker.create_training_job(TrainingJobName="my-detectron2-job",
+    #         AlgorithmSpecification={
+    #             'TrainingImage': '763104351884.dkr.ecr.us-east-2.amazonaws.com/pytorch-training:1.13.1-gpu-py39-cu117-ubuntu20.04-sagemaker',
+    #             'TrainingInputMode': 'File'},
+    #         RoleArn='arn:aws:iam::346717860071:role/SageMakerTrainer',
+    #         InputDataConfig = [{
+    #             'ChannelName': 'training',
+    #             'DataSource': {
+    #                 'S3DataSource': {
+    #                     'S3DataType': 'S3Prefix',
+    #                     'S3Uri': 's3://vla-bucket1/semantic/',
+    #                     'S3DataDistributionType': 'FullyReplicated'
+    #                 }
+    #             }
+    #         }],
+    #                     OutputDataConfig = {'S3OutputPath':'s3://vla-bucket1/semantic-model-artifacts/'},
+    #         ResourceConfig={'InstanceType': 'ml.m5.xlarge','InstanceCount': 1,'VolumeSizeInGB': 30},                          
+    #         StoppingCondition={'MaxRuntimeInSeconds': 1800}                              
+    #                               )  
+    
     return loaded
 
 def load_aws(list,keyy):
@@ -330,10 +372,21 @@ class Dataset:
     def __init__(self,image_dir="C:/Users/vijay/Downloads/data"):
 
         self.image_dir = image_dir
-        self.dataset = self.load_data()
+        self.train_dataset = None#self.load_data()
+        self.val_dataset = None
+        self.total_dataset = self.load_data()
+
+    def load_valData(self):
+        return None
+        return self.total_dataset[:6500]
+
+    def load_trainData(self):
+        return None
+        return self.total_dataset[6500:]
 
     def load_data(self):
-
+        #Temporary!
+        return None
         pairs = set()
         Dataset = []
 
@@ -385,7 +438,6 @@ class Dataset:
         correct_dataset=self.fine_tune(np_arr)
         #TODO add data augmentation
         return correct_dataset
-
     def create_binary_mask(self,img_path,target_color=(251, 154, 153)):
         img = Image.open(img_path).convert("RGB")
         img_np = np.array(img)
@@ -395,21 +447,17 @@ class Dataset:
 
         return mask  # shape: (H, W), dtype: uint8 (values: 0 or 1)
     
-    def mask_to_rle(self,mask_tensor):
-        # Convert torch tensor to numpy
-        mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
+    def mask_to_polygon(self,mask_tensor):
+        mask_np = mask_tensor.cpu().numpy().astype('uint8')
+        contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Ensure it's in Fortran order for COCO RLE
-        mask_fortran = np.asfortranarray(mask_np)
-        
-        # Encode to RLE
-        rle = mask_util.encode(mask_fortran)
-        
-        # Decode bytes to string if needed
-        if isinstance(rle['counts'], bytes):
-            rle['counts'] = rle['counts'].decode('utf-8')
-        
-        return rle
+        polygons = []
+        for contour in contours:
+            if len(contour) >= 3:  # Need at least 3 points
+                polygon = contour.flatten().tolist()
+                if len(polygon) >= 6:  # Need at least 3 coordinate pairs
+                    polygons.append(polygon)
+        return polygons
 
 
     def crop_tight(self,bbox,mask,img):
@@ -455,7 +503,7 @@ class Dataset:
         return augmented_list
 
 
-    def fine_tune(self,dataset):
+    def fine_tune(self,dataset): 
         target_list = []
         samples = []
         #TODO editing of training needs to occur for loss computation
@@ -490,22 +538,33 @@ class Dataset:
                 print(f"Skipping frame {i} - no robot arm detected")
                 continue
 
-            boxes = torch.tensor([[pos[1].min(), pos[0].min(),
-                                pos[1].max(), pos[0].max()]], dtype=torch.float32)
-            
             # Get image dimensions
-            channels, height, width = imgT.shape
-            
+            img_path = "C:/Project/DL_HW/dataset/processed_images/image{i}.jpg"
+            img_pil = Image.fromarray(imgT.permute(1,2,0).numpy().astype('uint8'))
+            img_pil = img_pil.resize((256,256),Image.LANCZOS)
+            mask_pil = Image.fromarray(maskT.numpy().astype('uint8') * 255)
+            mask_resized = mask_pil.resize((256, 256), Image.NEAREST)
+            maskT = torch.tensor(np.array(mask_resized) > 0)
+            pos = torch.where(maskT > 0)
+
+            if pos[0].numel() == 0 or pos[1].numel() == 0:
+                print(f"Skipping frame {i} - no nonzero pixels in resized mask")
+                continue
+
+            boxes = torch.tensor([[pos[1].min(), pos[0].min(),
+                                pos[1].max(), pos[0].max()]], dtype=torch.float32)        
+            width, height =img_pil.size
+            img_pil.save(img_path)
             # Create sample dict
             sample = {
-                "image": imgT,
+                "file_name": img_path,
                 "height": height, 
                 "width": width,
                 "image_id": i,
                 "annotations": [{
                     "bbox": boxes[0].tolist(),
                     "category_id": 80,  # robot_arm class
-                    "segmentation": self.mask_to_rle(maskT),
+                    "segmentation": self.mask_to_polygon(maskT),
                     "area": maskT.sum().item(),
                     "iscrowd": 0,
                     "bbox_mode": BoxMode.XYXY_ABS
@@ -523,15 +582,16 @@ class Semanatic_Model():
         self.weight_file = weight_file
         self.weight_path = (f'{self.weight_dir}/{weight_file}')
         self.Dataset_obj = Dataset_obj
-        self.dataset = Dataset_obj.load_data()
+        self.dataset = None#Dataset_obj.load_data()
         self.cfg = get_cfg()
         self.device = device   
         self.model,self.optimizer=self.init_model()
-
+        self.backbone = self.model.backbone
+        self.fine_tuned = False
     def init_model(self):
 
-        DatasetCatalog.register("robosemantic_dataset",self.Dataset_obj.load_data)
-
+        DatasetCatalog.register("robosemantic_dataset",self.Dataset_obj.load_trainData)
+        DatasetCatalog.register("robot_val",self.Dataset_obj.load_valData)
         if self.weight_path==None:
             self.cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
         else:
@@ -541,21 +601,30 @@ class Semanatic_Model():
         # Dataset configuration
         self.cfg.DATASETS.TRAIN = ("robosemantic_dataset",)
         self.cfg.DATASETS.TEST = ("robot_val",)
-        self.cfg.DATALOADER.NUM_WORKERS = 2
+        self.cfg.DATALOADER.NUM_WORKERS = 0
         
         # Model configuration - CRITICAL PART FOR CUSTOM CLASSES
         # COCO has 80 classes, we're adding 1 more (robot_arm) = 81 total
         self.cfg.MODEL.ROI_HEADS.NUM_CLASSES = 81  # 80 COCO + 1 robot class
 
+        self.cfg.SOLVER.CLIP_GRADIENTS.ENABLED = True
+        self.cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE = "norm"
+        self.cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = 1.0
+        self.cfg.SOLVER.CLIP_GRADIENTS.NORM_TYPE = 2.0
+        self.cfg.TEST.EVAL_PERIOD = 0
+        self.cfg.SOLVER.CHECKPOINT_PERIOD = 1000
         self.cfg.SOLVER.IMS_PER_BATCH = 1
         self.cfg.SOLVER.BASE_LR = 0.00025
-        self.cfg.SOLVER.MAX_ITER = 10000    # Adjust based on your dataset size
+        self.cfg.SOLVER.MAX_ITER = 6000  # Adjust based on your dataset size
         self.cfg.SOLVER.STEPS = []         # Learning rate decay steps
 
         #TODO determine how batch training is going to work w/ aws and data augmentation
-        self.cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 4
+        self.cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 2
         self.cfg.MODEL.ROI_HEADS.POSITIVE_FRACTION = 0.25
-        self.cfg.MODEL.DEVICE = self.device
+        if torch.cuda.is_available():
+            self.cfg.MODEL.DEVICE = "cuda"
+        else:
+            self.cfg.MODEL.DEVICE = "cpu"
         # Output directory
         self.cfg.OUTPUT_DIR = self.weight_dir
         os.makedirs(self.cfg.OUTPUT_DIR, exist_ok=True)
@@ -568,30 +637,56 @@ class Semanatic_Model():
         try:
             checkpointer=DetectionCheckpointer(self.model,save_dir=self.weight_dir)
             checkpointer.save(file=self.weight_file)
-
+            self.fine_tuned = True
+            print("successfully saved")
         except Exception as e:
             print("error in saving model")
 
-    def load_model(self,type):
+    def load_model(self,type,weight_path):
         if type == 'train':
-            self.cfg.MODEL.WEIGHTS =self.weight_path
-            trainer = DefaultTrainer(self.cfg)
-            trainer.resume_or_load(resume=False)
-            trainer.train()
+            if self.fine_tuned:
+                self.cfg.MODEL.WEIGHTS =weight_path
+                trainer = DefaultTrainer(self.cfg)
+                trainer.resume_or_load(resume=False)
+                trainer.train()
+            else:
+                trainer = DefaultTrainer(self.cfg)
+                trainer.resume_or_load(resume=False)
+                trainer.train()
             return trainer
-            #where to store trainer?
         elif type == 'test':
-            self.cfg.MODEL.WEIGHTS = (self.weight_path)
-            predictor = DefaultPredictor(self.cfg)
-            predictor.resume_or_load(resume=True)
+            if self.fine_tuned:
+                self.cfg.MODEL.WEIGHTS = (weight_path)
+                predictor = DefaultPredictor(self.cfg)
+            else:
+                predictor = DefaultPredictor(self.cfg)
             return predictor
 
+    def predict(self,image):
+        image = torch.from_numpy(image).permute(2,0,1).float() / 255.0
+        transform = transforms.Compose([
+            transforms.Resize((256, 256)),  # Resize
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Standard ImageNet normalization
+                        std=[0.229, 0.224, 0.225])
+        ])
+
+        img_pil = transform(image).unsqueeze(0)
+        features=self.backbone(img_pil)
+        feature_highres=features['p2']
+        pooled = f.adaptive_avg_pool2d(feature_highres, (1, 1))
+        flattened = pooled.flatten(1)  #1,256 shape
+        return flattened
     def fine_tune(self):
         trainer = DefaultTrainer(self.cfg)
         trainer.train()
 
         print("dataset0 training finished")
-                     
+        try:
+            self.save_model()
+            print("dataset successfully saved")
+            self.fine_tuned = True
+        except Exception as e:
+            print(f"saving failed with {e}")         
         #check if there are internal folders if so parse through those
             #sort mask_color_* to their counterparts
 
@@ -599,12 +694,9 @@ class Semanatic_Model():
 #    features: ['action', 'observation.state', 'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'],
 
 if __name__ == '__main__':
+
     print("hello")
     device = torch.device('cpu')
-    x = torch.tensor([[1,5,6,4,3,9,5,2,0],[1,8,7,3,4,5,6,7,2]]).to(
-        device
-    )
-    trg = torch.tensor([[1,7,4,3,5,9,2,0],[1,5,6,2,4,7,6,2]]).to(device)
 
     src_pad_idx = 0
     trg_pad_idx = 0
@@ -620,9 +712,7 @@ if __name__ == '__main__':
     # print("potated",data2)
     #TODO what are the contents of ep_lens.npy and ep_start_ends_ids.npy
     ep_lens = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',allow_pickle=True)
-    ep_start_ends_ids = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',allow_pickle=True)
     ep_lens_obj = ep_lens[()]
-    ep_start_ends_ids_obj = ep_start_ends_ids[()]
 
     if isinstance(ep_lens_obj, dict):
         keys = ep_lens_obj.keys()
@@ -639,6 +729,9 @@ if __name__ == '__main__':
         #TODO figure out which camera view of roboseg aligns with which rgb calvin
         #ep_start_ends_ids_obj['info']['episodes'] are blank
         #TASK KEYS ARE JOINT EMBEDDING LANGUAGE INPUT: ep_lens_obj['language']['ann'][i]
+        print("number of task inputs:",len(ep_lens_obj['language']['ann']))
+        print("number of encoding outputs:",len(ep_lens_obj['language']['emb']))
+        print("length of available tasks: ",len(ep_lens_obj['info']['indx']))
         #Contains short pseudo language notation for tasks language input: ep_lens_obj['language']['task'][0]
         #EMB are hierarchal latent encoder output: ep_lens_obj['language']['emb'][i]
         #Contains indexes of start to end frames ep_lens_obj['info']['indx'][i]
@@ -647,16 +740,15 @@ if __name__ == '__main__':
         print(item)
         print(data[item].shape)
     print("successfully loaded CALVIN info!")
-    dataset_obj =Dataset("C:/Users/vijay/Downloads/data")
+    dataset_obj =Dataset()
     #Dataset=get_aws('semantic/dataset.npy')
 
     #dataset is a list of length 2 tuples where [0] is orig img and [1] is a np binary mask for class pred 92 (robot arm)
     print("successful save and load")
-    sem_model = Semanatic_Model(weight_directory='./cv_models',weight_file="semantic_robo_maskrcnn",Dataset_obj=dataset_obj)
+    sem_model = Semanatic_Model(weight_directory='./cv_models',weight_file="model_final.pth",Dataset_obj=dataset_obj)
+    sem_model.fine_tuned = True
 
-    #ROBOT IS CLASS ID 91
     print("inited model")
-    
      # Built from config
 
     print("saved model")
@@ -666,17 +758,60 @@ if __name__ == '__main__':
     saved_path="./output/model_robot_final.pth"
     
     print("loaded model test")
-    #TODO FINISH FINE TUNE METHOD W AWSs
-    sem_model.fine_tune()
+    #TODO FINISH FINE TUNE METHOD overnight
+    #sem_model.fine_tune()
     print("fine tuning complete")
-    # path = "C:/Project/DL_HW/dataset/images_backup_aks_race/2025-06-06-17-04-01"
-    # op_path = "C:/Project/DL_HW/dataset/4.mp4"
-    # detectronProcess(predictor,path,op_path)
-    # detectronProcess(predictor,data['rgb_static'],data['rgb_gripper'],data['rgb_tactile'][:,:,:3])
+
     transfurmer= Transformer(src_vocab_size,trg_vocab_size,src_pad_idx,trg_pad_idx).to(
         device
     )
     
+    #TODO Logic for simulated action loop" 
+    print("number of task inputs:",len(ep_lens_obj['language']['ann']))
+    print("number of encoding outputs:",len(ep_lens_obj['language']['emb']))
+    print("length of available tasks: ",len(ep_lens_obj['info']['indx']))
+    #len(ep_lens_obj['language']['ann'])
+    
+    for i in range(1): #len(ep_lens_obj['info']['indx'])
+        print("episode ranges")
+        start_index, end_index =(ep_lens_obj['info']['indx'][i])
+        print(start_index,end_index)
+        episode_range = end_index-start_index
+
+        start_path=f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{start_index}.npz"
+        end_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{end_index}.npz"
+        start_data = load(start_path)
+        end_data=load(end_path)
+        start_files = start_data.files
+        concatenated_op=torch.FloatTensor(1,episode_range+1,7)
+
+        for j in range(episode_range+1):
+            curr_index=start_index+j
+            curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index}.npz"
+            curr_file=load(curr_path)
+            curr_keys = curr_file.files
+            concatenated_op[0,j]=torch.from_numpy(curr_file['rel_actions'])
+
+            if j == 0:
+                firstImg=curr_file['rgb_static']
+            #will use rel actions for learning
+        
+        curr_vision_ip = start_data['rgb_static']
+        curr_emb_op=ep_lens_obj['language']['emb'][i]
+        curr_language_ip=ep_lens_obj['language']['ann'][i]
+        print(curr_language_ip)
+        print(concatenated_op.shape)
+        concatenated_op_flat = concatenated_op.view(1,-1)
+        print(curr_emb_op.shape)
+        #img might need to be a 255x255
+        semantic_inference=sem_model.predict(firstImg)
+        x=transfurmer.MultiModalProjection(raw_text=curr_language_ip,raw_img=semantic_inference)
+        
+        #bound to be error prone
+        transfurmer.forward(x,concatenated_op)
+        #TODO full pass w encoder and decoder output
+
+
     print("model successfully initialized")
     #out = model(x,trg[:,:-1])
     #model.compute_loss(out,trg)
