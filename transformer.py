@@ -73,10 +73,18 @@ class Encoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self,x,mask):
+        #TODO consider sinusoidal dynamic embedding size
+        x = x.squeeze(0)
+        mask = mask.squeeze(0)
         N, seq_length = x.shape
-        positions = torch.arange(0,seq_length).expand(N,seq_length).to(self.device)
+        x=x.long()
+        positions = torch.arange(N, device=self.device)
+        positions = positions.long()
+        PP=self.positional_encoding(positions)
+        print(positions.shape)
+        out=self.dropout(x + self.positional_encoding(positions)) 
+        out = out.unsqueeze(0)
 
-        out=self.dropout(self.word_encoding(x) + self.positional_encoding(positions)) 
         for layer in self.layers:
             out = layer(out, out, out, mask)
 
@@ -125,28 +133,33 @@ class DecoderBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(
             self,
-            src_vocab_size,
+            src_vocab_size, #400 for max natural language command
             trg_vocab_size,
             src_pad_idx,
             trg_pad_idx,
-            embed_size=256,
+            max_src_size,
+            max_trg_size,
+            embed_size=768,
             num_layers=6,
             forward_expansion=4,
-            heads = 8,
+            heads = 10,
             dropout = 0,
             device="cpu",
-            max_length = 5000
+            max_length = 5000,
+            
 
     ):
         super(Transformer,self).__init__()
-
+        self.embedding_size=embed_size
+        self.max_src_size = max_src_size
+        self.max_trg_size = max_trg_size
+        
         self.encoder = Encoder(
-            src_vocab_size,
-            1,
-            embed_size=1000,
+            src_vocab_size=768,
+            max_length=300,
+            embed_size=768,
             num_length=6,
-            heads=10,
-            # Parameter 'device' from Transformer passed to Encoder's 'device'
+            heads=8,
   # Parameter 'forward_expansion' from Transformer passed to Encoder's 'forward_expansion'
            # Parameter 'dropout' from Transformer passed to Encoder's 'dropout'
             dropout=0, 
@@ -157,9 +170,9 @@ class Transformer(nn.Module):
         self.decoder = Decoder(
             trg_vocab_size,
             max_size=100,
-            embed_size=5000,
+            embed_size=768,
             num_layers=6,
-            heads=10,
+            heads=8,
             forward_expansion=forward_expansion,
             dropout=0,
             device='cpu',
@@ -194,15 +207,30 @@ class Transformer(nn.Module):
         return x
 
     def make_src_mask(self,src):
-        src_mask = (src!=self.src_pad_idx).unsqueeze(-1).unsqueeze(2)
-        return src_mask.to(self.device)
+        padded = torch.zeros(len(src), len(src[0]), self.embedding_size)
+        #padded is actual data with 0s being non vals
+        #maks is a flattened tensor with Trues being non vals
+        mask = torch.ones(len(src),len(src[0]),dtype=torch.bool)
+
+        for i, seq in enumerate(src):
+            length = seq.size(0)
+            padded[i,:length,:] = seq
+            mask[i,:length]=False
+        mask = mask.unsqueeze(0).unsqueeze(1).unsqueeze(2)  # [1, 1, 1, 300]
+
+        return mask.to(device)
+
     
     def make_trg_mask(self,trg):
-        N,trg_len = trg.shape
-        trg_mask = torch.tril(torch.ones((trg_len,trg_len))).expand(
-            N,1,trg_len,trg_len
-        )
-        return trg_mask.to(self.device)
+        B, T, _ = trg.shape  # Batch size, target length, feature dim
+
+        # Create lower triangular mask
+        causal_mask = torch.tril(torch.ones((T, T), device=trg.device)).bool()  # (T, T)
+
+        # Expand to (B, 1, T, T) for broadcasting across heads
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(1).expand(B, 1, T, T)
+
+        return causal_mask.to(device)
     
     def inference(self,src,max_len=100,start_token=1, end_token=2):
         #used for inference mode 
@@ -234,7 +262,9 @@ class Transformer(nn.Module):
         src_mask = self.make_src_mask(src)
         trg_mask = self.make_trg_mask(trg)
         enc_src = self.encoder(src,src_mask)
+        print("GOTTA DECODE")
         out = self.decoder(trg, enc_src, src_mask=src_mask,trg_mask=trg_mask)
+        print("GOTTA DECODE")
         #decoder arguments: self,x,enc_out,trg_mask,src_mask)
         return out
     
@@ -257,20 +287,20 @@ class TransformerBlock(nn.Module):
         self.Attention = selfAttention(self.embedding_size,self.heads)
 
         self.feed_forward = nn.Sequential(
-            nn.Linear(2 * self.embedding_size,self.embedding_size*expansion_rate),
+            nn.Linear(self.embedding_size,self.embedding_size*expansion_rate),
             nn.ReLU(),
             nn.Linear(self.embedding_size*expansion_rate,self.embedding_size)
         )
 
-        self.l1 = nn.LayerNorm(2*embedding_size)
-        self.l2 = nn.LayerNorm(2*embedding_size)
+        self.l1 = nn.LayerNorm(embedding_size)
+        self.l2 = nn.LayerNorm(embedding_size)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self,value,key,query,mask):
         attention = self.Attention.forward(value, key, query, mask)
-        x = self.dropout(self.l1(attention + query))
+        x = self.dropout(self.l1(attention+query))
         y = self.feed_forward(x)
-        out = self.dropout(self.l2(y + x))
+        out = self.dropout(self.l2(x+y))
 
         return out
         
@@ -279,7 +309,7 @@ class TransformerBlock(nn.Module):
         #use dropout after the linear and norm
         
 
-class selfAttention:
+class selfAttention(nn.Module):
     def __init__(self,embedding_size,heads):
         super(selfAttention,self).__init__()
         self.embedding_size = embedding_size
@@ -288,36 +318,31 @@ class selfAttention:
 
         self.head_size = (embedding_size // heads)
         assert (self.head_size * heads == embedding_size)
-        self.values = nn.Linear(self.head_size,self.head_size,bias=False)
-        self.queries = nn.Linear(self.head_size,self.head_size,bias=False)
-        self.keys = nn.Linear(self.head_size,self.head_size,bias=False)
+        self.values = nn.Linear(self.embedding_size,self.embedding_size,bias=False)
+        self.queries = nn.Linear(self.embedding_size,self.embedding_size,bias=False)
+        self.keys = nn.Linear(self.embedding_size,self.embedding_size,bias=False)
         self.fc_out = nn.Linear(self.embedding_size,self.embedding_size,bias=False)
 
     def forward(self,values,keys,queries,mask):
         value_len, keys_len, queries_len = values.shape[1], keys.shape[1], queries.shape[1]
         N = queries.shape[0]
-        
-        values.reshape(N, value_len, self.heads, self.head_size)
-        queries.reshape(N, queries_len, self.heads, self.head_size)
-        keys.reshape(N, keys_len, self.heads, self.head_size)
-        print("debug print:",values.shape,queries.shape,keys.shape)
-
 
         values = self.values(values)
         keys = self.keys(keys)
         queries = self.queries(queries)
-        
+
+        values=values.reshape(N, value_len, self.heads, self.head_size)
+        queries=queries.reshape(N, queries_len, self.heads, self.head_size)
+        keys=keys.reshape(N, keys_len, self.heads, self.head_size)
+
         #TODO look into how einsum works
         energy = torch.einsum("nqhd,nkhd->nhqk",[queries,keys])
 
         if mask is not None:
             energy.masked_fill(mask == 0,float(1e-24))
-
         attention = f.softmax(energy/((self.embedding_size)**(1/2)),dim=3)
-        print("if we ever get here",attention.shape)
         out = torch.einsum("nhql,nlhd->nqhd",[attention,values]).reshape(N,queries_len,self.embedding_size)
         out = self.fc_out(out)
-
         return out
 
 def get_aws(keyy):
@@ -700,8 +725,8 @@ if __name__ == '__main__':
 
     src_pad_idx = 0
     trg_pad_idx = 0
-    src_vocab_size = 10
-    trg_vocab_size = 10
+    src_vocab_size = 300
+    trg_vocab_size = 300 #trg may be too big here, but better safe than sorry
     data = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0358656.npz')
     lst = data.files
     data1 = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',allow_pickle=True)
@@ -762,7 +787,7 @@ if __name__ == '__main__':
     #sem_model.fine_tune()
     print("fine tuning complete")
 
-    transfurmer= Transformer(src_vocab_size,trg_vocab_size,src_pad_idx,trg_pad_idx).to(
+    transfurmer= Transformer(src_vocab_size,trg_vocab_size,src_pad_idx,trg_pad_idx,max_src_size=300,max_trg_size=300).to(
         device
     )
     
