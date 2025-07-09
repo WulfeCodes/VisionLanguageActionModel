@@ -63,7 +63,7 @@ class Encoder(nn.Module):
         super(Encoder,self).__init__()
         self.positional_encoding = nn.Embedding(max_length,embed_size)
         self.device = device
-        self.word_encoding = nn.Embedding(src_vocab_size,embed_size)
+        self.word_encoding = nn.Linear(768,embed_size)
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(embed_size,heads,final_expansion,dropout)
@@ -77,57 +77,65 @@ class Encoder(nn.Module):
         x = x.squeeze(0)
         mask = mask.squeeze(0)
         N, seq_length = x.shape
+        x=self.word_encoding(x)
         x=x.long()
         positions = torch.arange(N, device=self.device)
         positions = positions.long()
-        PP=self.positional_encoding(positions)
-        print(positions.shape)
         out=self.dropout(x + self.positional_encoding(positions)) 
         out = out.unsqueeze(0)
-
         for layer in self.layers:
             out = layer(out, out, out, mask)
-
+        out = out.mean(dim=1,keepdim=True)
         return out
 
 class Decoder(nn.Module):
     def __init__(self,trg_vocab_size,max_size, embed_size, dropout, heads,
-                 forward_expansion,device,num_layers):
+                 forward_expansion,device,encSize,num_layers):
         super(Decoder,self).__init__()
 
-        self.positional_embeddings = nn.Embedding(trg_vocab_size,embed_size)
-        self.token_embeddings = nn.Embedding(max_size,embed_size)
+        self.positional_embeddings = nn.Embedding(max_size,embed_size)
+        self.token_embeddings = nn.Linear(7,embed_size)
         self.layers=nn.ModuleList(
-            DecoderBlock(forward_expansion,dropout,embed_size,heads,device)
+            DecoderBlock(forward_expansion,dropout,embed_size,heads,encSize,device)
             for _ in range(num_layers)
         )
         self.device = device
         self.fc_out = nn.Linear(embed_size,trg_vocab_size)
         self.dropout = nn.Dropout(dropout)
-    def forward(self,x,enc_out,trg_mask,src_mask):
-        N, seq_len = x.shape()
-        positions=torch.arange(0,seq_len).expand(N,seq_len).to(self.device)
-        x = self.dropout(self.token_embeddings(x)+self.positional_embeddings(positions))
+    def forward(self,x,trg,enc_out,trg_mask,src_mask):
+
+        B,N, seq_length = trg.shape
+        positions = torch.arange(N, device=self.device)
+        positions = positions.long()
+        out=self.dropout((self.token_embeddings(trg)).long() + self.positional_embeddings(positions)) 
 
         for layer in self.layers:
             #took out src_mask 
-            x = layer(x,enc_out,enc_out,trg_mask)
-        out = self.fc_out(x)
+            out = layer(out,enc_out,enc_out,src_mask,trg_mask)
+        out = self.fc_out(out)
         return out
 
 class DecoderBlock(nn.Module):
-    def __init__(self,forward_expansion,dropout,embed_size,heads,device):
+    def __init__(self,forward_expansion,dropout,embed_size,heads,encSize,device):
         super(DecoderBlock,self).__init__()
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(embed_size*2)
+        self.layer_norm = nn.LayerNorm(embed_size)
         self.attention = selfAttention(embed_size,heads)
         self.transfurmer = TransformerBlock(embed_size,heads,forward_expansion,dropout)
-        
-    def forward(self,X,key,value,mask):
-        attention = self.attention.forward(X,X,X,mask)
-        y=self.dropout(self.layer_norm(attention+X))
-        out=self.transfurmer.forward(value,key,y,mask)
+        self.keyProjection = nn.Linear(encSize,embed_size)
+        self.valueProjection = nn.Linear(encSize,embed_size)  
 
+        self.encSize = encSize
+    def forward(self,x,key,value,src_mask,trg_mask):
+
+        attention = self.attention.forward(x,x,x,trg_mask)
+        #attend mask properly, feed thru check, logic shape
+        y=self.dropout(self.layer_norm(attention+x))
+        if len(key[-1]) != len(x[-1]):
+            value=self.valueProjection(value)
+            key = self.keyProjection(key)
+
+        out=self.transfurmer.forward(value,key,y,trg_mask)
         return out
 
 class Transformer(nn.Module):
@@ -140,13 +148,14 @@ class Transformer(nn.Module):
             max_src_size,
             max_trg_size,
             embed_size=768,
+            enc_emb_size=384,
             num_layers=6,
             forward_expansion=4,
             heads = 10,
             dropout = 0,
             device="cpu",
             max_length = 5000,
-            
+            actionDim = 7
 
     ):
         super(Transformer,self).__init__()
@@ -157,7 +166,7 @@ class Transformer(nn.Module):
         self.encoder = Encoder(
             src_vocab_size=768,
             max_length=300,
-            embed_size=768,
+            embed_size=enc_emb_size,
             num_length=6,
             heads=8,
   # Parameter 'forward_expansion' from Transformer passed to Encoder's 'forward_expansion'
@@ -175,6 +184,7 @@ class Transformer(nn.Module):
             heads=8,
             forward_expansion=forward_expansion,
             dropout=0,
+            encSize=enc_emb_size,
             device='cpu',
         )
     
@@ -190,7 +200,7 @@ class Transformer(nn.Module):
         self.sep_token_id = self.tokenizer.convert_tokens_to_ids('</s>')
         self.pretrained_sep_emb = self.token_model.embeddings.word_embeddings.weight[self.sep_token_id].unsqueeze(0).unsqueeze(0)  # shape (1,1,D)
         self.sep_token = nn.Parameter(self.pretrained_sep_emb.clone())  # Initialize with pretrained
-        
+        self.actionProj = nn.Linear(trg_vocab_size,actionDim)
         self.imageProj = nn.Linear(1,self.embedding_size)
 
 
@@ -228,7 +238,7 @@ class Transformer(nn.Module):
         causal_mask = torch.tril(torch.ones((T, T), device=trg.device)).bool()  # (T, T)
 
         # Expand to (B, 1, T, T) for broadcasting across heads
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(1).expand(B, 1, T, T)
+        causal_mask = causal_mask.unsqueeze(0).expand(B, 1, T, T)
 
         return causal_mask.to(device)
     
@@ -258,15 +268,26 @@ class Transformer(nn.Module):
                 return trg
         
 
-    def forward(self,src,trg):
-        src_mask = self.make_src_mask(src)
-        trg_mask = self.make_trg_mask(trg)
-        enc_src = self.encoder(src,src_mask)
-        print("GOTTA DECODE")
-        out = self.decoder(trg, enc_src, src_mask=src_mask,trg_mask=trg_mask)
-        print("GOTTA DECODE")
+    def forward(self,src,trg,enc_op=None):
+        if enc_op == None:
+            src_mask = self.make_src_mask(src)
+            trg_mask = self.make_trg_mask(trg)
+            enc_src = self.encoder(src,src_mask)
+            out = self.decoder(src,trg, enc_src, src_mask=src_mask,trg_mask=trg_mask)
+            
+            out = self.actionProj(out)
+            #should we squeeze now?
+            return out[:,-1,:],enc_op
+        else: 
+            src_mask = self.make_src_mask(src)
+            trg_mask = self.make_trg_mask(trg)
+            enc_src = self.encoder(src,src_mask)
+            out = self.decoder(src,trg, enc_src, src_mask=src_mask,trg_mask=trg_mask)
+            
+            out = self.actionProj(out)
+            #should we squeeze now?
+            return out[:,-1,:]
         #decoder arguments: self,x,enc_out,trg_mask,src_mask)
-        return out
     
     def compute_loss(self,output,trg):
         logits = output.view(-1,output.size(-1))
@@ -296,12 +317,13 @@ class TransformerBlock(nn.Module):
         self.l2 = nn.LayerNorm(embedding_size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self,value,key,query,mask):
+    def forward(self,value,key,query,mask,srcType=None):
+
         attention = self.Attention.forward(value, key, query, mask)
         x = self.dropout(self.l1(attention+query))
         y = self.feed_forward(x)
         out = self.dropout(self.l2(x+y))
-
+        
         return out
         
         
@@ -323,7 +345,8 @@ class selfAttention(nn.Module):
         self.keys = nn.Linear(self.embedding_size,self.embedding_size,bias=False)
         self.fc_out = nn.Linear(self.embedding_size,self.embedding_size,bias=False)
 
-    def forward(self,values,keys,queries,mask):
+    def forward(self,values,keys,queries,mask,srcType=None):
+
         value_len, keys_len, queries_len = values.shape[1], keys.shape[1], queries.shape[1]
         N = queries.shape[0]
 
@@ -335,8 +358,8 @@ class selfAttention(nn.Module):
         queries=queries.reshape(N, queries_len, self.heads, self.head_size)
         keys=keys.reshape(N, keys_len, self.heads, self.head_size)
 
-        #TODO look into how einsum works
         energy = torch.einsum("nqhd,nkhd->nhqk",[queries,keys])
+
 
         if mask is not None:
             energy.masked_fill(mask == 0,float(1e-24))
@@ -726,7 +749,7 @@ if __name__ == '__main__':
     src_pad_idx = 0
     trg_pad_idx = 0
     src_vocab_size = 300
-    trg_vocab_size = 300 #trg may be too big here, but better safe than sorry
+    trg_vocab_size = 384 #trg may be too big here, but better safe than sorry
     data = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0358656.npz')
     lst = data.files
     data1 = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',allow_pickle=True)
@@ -787,7 +810,7 @@ if __name__ == '__main__':
     #sem_model.fine_tune()
     print("fine tuning complete")
 
-    transfurmer= Transformer(src_vocab_size,trg_vocab_size,src_pad_idx,trg_pad_idx,max_src_size=300,max_trg_size=300).to(
+    transfurmer= Transformer(src_vocab_size,trg_vocab_size,src_pad_idx,trg_pad_idx,max_src_size=300,max_trg_size=300,actionDim=7).to(
         device
     )
     
@@ -809,6 +832,9 @@ if __name__ == '__main__':
         end_data=load(end_path)
         start_files = start_data.files
         concatenated_op=torch.FloatTensor(1,episode_range+1,7)
+        curr_vision_ip = start_data['rgb_static']
+        curr_emb_op=ep_lens_obj['language']['emb'][i]
+        curr_language_ip=ep_lens_obj['language']['ann'][i]
 
         for j in range(episode_range+1):
             curr_index=start_index+j
@@ -819,21 +845,20 @@ if __name__ == '__main__':
 
             if j == 0:
                 firstImg=curr_file['rgb_static']
+                semantic_inference=sem_model.predict(firstImg)
+                x=transfurmer.MultiModalProjection(raw_text=curr_language_ip,raw_img=semantic_inference)
+                trg_output,enc_output=transfurmer.forward(x,concatenated_op)
+            else:
+                output=transfurmer.forward(x,concatenated_op,enc_output)    
+            #compute loss of end
             #will use rel actions for learning
         
-        curr_vision_ip = start_data['rgb_static']
-        curr_emb_op=ep_lens_obj['language']['emb'][i]
-        curr_language_ip=ep_lens_obj['language']['ann'][i]
         print(curr_language_ip)
         print(concatenated_op.shape)
-        concatenated_op_flat = concatenated_op.view(1,-1)
-        print(curr_emb_op.shape)
-        #img might need to be a 255x255
-        semantic_inference=sem_model.predict(firstImg)
-        x=transfurmer.MultiModalProjection(raw_text=curr_language_ip,raw_img=semantic_inference)
+        #img need to be a 255x255
+
         
         #bound to be error prone
-        transfurmer.forward(x,concatenated_op)
         #TODO full pass w encoder and decoder output
 
 
