@@ -41,8 +41,7 @@ import pycocotools.mask as mask_util
 import matplotlib.pyplot as plt
 from torchvision.models.detection import maskrcnn_resnet50_fpn
 
-#TODO MaskRCNN training: train on aws,
-#TODO NEXT STEPS: CREATE INFERENCE FUNCTION FOR ITERATIVE GENERATIONS, CREATE TRAINING, think about encoder training, BPE/DCT
+#TODO validation transformer/semantic model function, end token 
 #incorporate beam search inference?
 #check for start/padding/end tokens in CALVIN, 
 # import some common libraries
@@ -294,8 +293,77 @@ class Transformer(nn.Module):
         loss = self.criterion(logits,targets)
         return loss
 
+    def train(self,file_path,mseLoss,optimizer,sem_model,savePath):
+
+        ep_lens = load(file_path,allow_pickle=True)
+        ep_lens_obj = ep_lens[()]
 
 
+        for i in range(len(ep_lens_obj['info']['indx'])): 
+            encLoss = 0
+            decLoss = 0
+            print("episode ranges")
+            start_index, end_index =(ep_lens_obj['info']['indx'][i])
+            print(start_index,end_index)
+            episode_range = end_index-start_index
+
+            start_path=f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{start_index}.npz"
+            end_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{end_index}.npz"
+            start_data = load(start_path)
+            end_data=load(end_path)
+            start_files = start_data.files
+            concatenated_op=torch.FloatTensor(1,episode_range+1,7).to(torch.float32)
+            curr_vision_ip = start_data['rgb_static']
+            curr_emb_op=torch.from_numpy(ep_lens_obj['language']['emb'][i])
+            curr_language_ip=ep_lens_obj['language']['ann'][i]
+
+            for j in range(episode_range):
+                curr_index=start_index+j
+                curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index}.npz"
+                curr_file=load(curr_path)
+                next_path = curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index+1}.npz"
+                next_file = load(next_path)
+                curr_keys = curr_file.files
+                concatenated_op[0,j]=torch.from_numpy(curr_file['rel_actions']).to(torch.float32)
+                nextInput=torch.from_numpy(next_file['rel_actions']).to(torch.float32)
+                nextInput
+                if j == 0:
+                    firstImg=curr_file['rgb_static']
+                    semantic_inference=sem_model.predict(firstImg)
+                    x=transfurmer.MultiModalProjection(raw_text=curr_language_ip,raw_img=semantic_inference)
+                    trg_output,enc_output=transfurmer.forward(x,concatenated_op[:,:j+1,:])
+                    enc_output = enc_output.squeeze(0)
+                    trg_output = trg_output.squeeze(0)
+
+                else:
+                    trg_output=transfurmer.forward(x,concatenated_op,enc_output)    
+                    trg_output = trg_output.squeeze(0)
+                decLoss+=mseLoss(trg_output,nextInput)
+                encLoss+=mseLoss(enc_output,curr_emb_op)
+                #compute loss of end
+                #will use rel actions for learning
+            loss = torch.Tensor(decLoss) + torch.Tensor(encLoss)
+            loss=loss.to(torch.float32)
+            print(f"loss:{loss} for {curr_language_ip}")
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            print(curr_language_ip)
+            print(concatenated_op.shape)
+            #img need to be a 255x255
+
+        print("model successfully initialized")
+        print("finished training")
+        self.save_model(savePath)
+
+    def save_model(self,file_path):
+        torch.save(self.state_dict(),file_path)
+        print("saved")
+
+    def load_model(self,file_path,device='cpu'):
+        self.load_state_dict(file_path,map_location=device)
+        print("loaded")
 
 class TransformerBlock(nn.Module):
     def __init__(self,embedding_size,heads,expansion_rate,dropout):
@@ -424,16 +492,15 @@ class Dataset:
         self.total_dataset = self.load_data()
 
     def load_valData(self):
-        return None
+
         return self.total_dataset[:6500]
 
     def load_trainData(self):
-        return None
+
         return self.total_dataset[6500:]
 
     def load_data(self):
-        #Temporary!
-        return None
+
         pairs = set()
         Dataset = []
 
@@ -622,7 +689,7 @@ class Dataset:
 
         return samples
 
-class Semanatic_Model():
+class Segmentation_Model():
 
     def __init__(self,weight_directory=None,weight_file=None,Dataset_obj=None,device='cpu'):
         self.weight_dir = weight_directory
@@ -640,10 +707,11 @@ class Semanatic_Model():
         DatasetCatalog.register("robosemantic_dataset",self.Dataset_obj.load_trainData)
         DatasetCatalog.register("robot_val",self.Dataset_obj.load_valData)
         if self.weight_path==None:
+            self.cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
             self.cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
         else:
+            self.cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
             self.cfg.MODEL.WEIGHTS = self.weight_path
-        self.cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
 
         # Dataset configuration
         self.cfg.DATASETS.TRAIN = ("robosemantic_dataset",)
@@ -749,50 +817,26 @@ if __name__ == '__main__':
     trg_pad_idx = 0
     src_vocab_size = 300
     trg_vocab_size = 384 #trg may be too big here, but better safe than sorry
-    data = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0358656.npz')
-    lst = data.files
-    data1 = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',allow_pickle=True)
-    structured_object = data1[()]
+
 
     # #files return all the keys of the npz dictionary?
     # print("annotated",data1)
     # print("potated",data2)
-    #TODO what are the contents of ep_lens.npy and ep_start_ends_ids.npy
-    ep_lens = load('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',allow_pickle=True)
-    ep_lens_obj = ep_lens[()]
 
-    if isinstance(ep_lens_obj, dict):
-        keys = ep_lens_obj.keys()
-        print(f"The keys in the structured object are: {list(keys)}")
-        keys0 = ep_lens_obj['language'].keys()
-        keys1 = ep_lens_obj['info'].keys()
-        print(f"the keys0,1 in the eps len bject are {keys0},{keys1}")
-        print(ep_lens_obj['language']['task'][0])
-        print("length",len(ep_lens_obj['language']['task']))
-        #ep_lens_obj['info']['episodes'] is blank
-        print(ep_lens_obj['info']['indx'][0])
+    #ep_start_ends_ids_obj['info']['episodes'] are blank
+    #TASK KEYS ARE JOINT EMBEDDING LANGUAGE INPUT: ep_lens_obj['language']['ann'][i]
+  
+    #Contains short pseudo language notation for tasks language input: ep_lens_obj['language']['task'][0]
+    #EMB are hierarchal latent encoder output: ep_lens_obj['language']['emb'][i]
+    #Contains indexes of start to end frames ep_lens_obj['info']['indx'][i]
+    #ep_start_ends_ids_obj['info']['indx'][i] contains raw shapes of cameras and grippers
 
-        #length 9
-        #TODO figure out which camera view of roboseg aligns with which rgb calvin
-        #ep_start_ends_ids_obj['info']['episodes'] are blank
-        #TASK KEYS ARE JOINT EMBEDDING LANGUAGE INPUT: ep_lens_obj['language']['ann'][i]
-        print("number of task inputs:",len(ep_lens_obj['language']['ann']))
-        print("number of encoding outputs:",len(ep_lens_obj['language']['emb']))
-        print("length of available tasks: ",len(ep_lens_obj['info']['indx']))
-        #Contains short pseudo language notation for tasks language input: ep_lens_obj['language']['task'][0]
-        #EMB are hierarchal latent encoder output: ep_lens_obj['language']['emb'][i]
-        #Contains indexes of start to end frames ep_lens_obj['info']['indx'][i]
-        #ep_start_ends_ids_obj['info']['indx'][i] contains raw shapes of cameras and grippers
-    for item in lst:
-        print(item)
-        print(data[item].shape)
-    print("successfully loaded CALVIN info!")
     dataset_obj =Dataset()
     #Dataset=get_aws('semantic/dataset.npy')
 
     #dataset is a list of length 2 tuples where [0] is orig img and [1] is a np binary mask for class pred 92 (robot arm)
     print("successful save and load")
-    sem_model = Semanatic_Model(weight_directory='./cv_models',weight_file="model_final.pth",Dataset_obj=dataset_obj)
+    sem_model = Segmentation_Model(weight_directory='./cv_models',weight_file="model_final.pth",Dataset_obj=dataset_obj)
     sem_model.fine_tuned = True
 
     print("inited model")
@@ -805,7 +849,6 @@ if __name__ == '__main__':
     saved_path="./output/model_robot_final.pth"
     
     print("loaded model test")
-    #TODO FINISH FINE TUNE METHOD overnight
     #sem_model.fine_tune()
     print("fine tuning complete")
 
@@ -817,72 +860,5 @@ if __name__ == '__main__':
     mseLoss = nn.MSELoss()
     optimizer = torch.optim.Adam(transfurmer.parameters(),lr=1e-4)
 
-    #TODO Logic for simulated action loop" 
-    print("number of task inputs:",len(ep_lens_obj['language']['ann']))
-    print("number of encoding outputs:",len(ep_lens_obj['language']['emb']))
-    print("length of available tasks: ",len(ep_lens_obj['info']['indx']))
-    #len(ep_lens_obj['language']['ann'])
-    
-    for i in range(len(ep_lens_obj['info']['indx'])): 
-        encLoss = 0
-        decLoss = 0
-        print("episode ranges")
-        start_index, end_index =(ep_lens_obj['info']['indx'][i])
-        print(start_index,end_index)
-        episode_range = end_index-start_index
-
-        start_path=f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{start_index}.npz"
-        end_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{end_index}.npz"
-        start_data = load(start_path)
-        end_data=load(end_path)
-        start_files = start_data.files
-        concatenated_op=torch.FloatTensor(1,episode_range+1,7).to(torch.float32)
-        curr_vision_ip = start_data['rgb_static']
-        curr_emb_op=torch.from_numpy(ep_lens_obj['language']['emb'][i])
-        curr_language_ip=ep_lens_obj['language']['ann'][i]
-
-        for j in range(episode_range):
-            curr_index=start_index+j
-            curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index}.npz"
-            curr_file=load(curr_path)
-            next_path = curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index+1}.npz"
-            next_file = load(next_path)
-            curr_keys = curr_file.files
-            concatenated_op[0,j]=torch.from_numpy(curr_file['rel_actions']).to(torch.float32)
-            nextInput=torch.from_numpy(next_file['rel_actions']).to(torch.float32)
-            nextInput
-            if j == 0:
-                firstImg=curr_file['rgb_static']
-                semantic_inference=sem_model.predict(firstImg)
-                x=transfurmer.MultiModalProjection(raw_text=curr_language_ip,raw_img=semantic_inference)
-                trg_output,enc_output=transfurmer.forward(x,concatenated_op[:,:j+1,:])
-                enc_output = enc_output.squeeze(0)
-                trg_output = trg_output.squeeze(0)
-
-            else:
-                trg_output=transfurmer.forward(x,concatenated_op,enc_output)    
-                trg_output = trg_output.squeeze(0)
-            decLoss+=mseLoss(trg_output,nextInput)
-            encLoss+=mseLoss(enc_output,curr_emb_op)
-            #compute loss of end
-            #will use rel actions for learning
-        loss = torch.Tensor(decLoss) + torch.Tensor(encLoss)
-        loss=loss.to(torch.float32)
-        print(f"loss:{loss} for {curr_language_ip}")
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        print(curr_language_ip)
-        print(concatenated_op.shape)
-        #img need to be a 255x255
-
-        
-        #bound to be error prone
-        #TODO full pass w encoder and decoder output
-
-
-    print("model successfully initialized")
-    #out = model(x,trg[:,:-1])
-    #model.compute_loss(out,trg)
-    #print(out.shape)
+    transfurmer.train('C:/Project/DL_HW/dataset/calvin_debug_dataset/training/lang_annotations/auto_lang_ann.npy',mseLoss,optimizer,sem_model,savePath="./transformerModels/TFmodel.pth")
+    transfurmer.load_model(file_path="./transformerModels/TFmodel.pth")
