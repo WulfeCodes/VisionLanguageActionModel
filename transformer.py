@@ -131,10 +131,8 @@ class DecoderBlock(nn.Module):
         attention = self.attention.forward(x,x,x,trg_mask)
         #attend mask properly, feed thru check, logic shape
         y=self.dropout(self.layer_norm(attention+x))
-        if len(key[-1]) != len(x[-1]):
-            value=self.valueProjection(value)
-            key = self.keyProjection(key)
-
+        value=self.valueProjection(value)
+        key = self.keyProjection(key)
         out=self.transfurmer.forward(value,key,y,trg_mask)
         return out
 
@@ -193,7 +191,7 @@ class Transformer(nn.Module):
         self.device = 'cpu'
         #TODO add correct ignore index
         #tokenization inits 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+        
         self.tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
         self.token_model = RobertaModel.from_pretrained('roberta-base')
         self.embedding_size = self.token_model.config.hidden_size
@@ -277,7 +275,7 @@ class Transformer(nn.Module):
             
             out = self.actionProj(out)
             #should we squeeze now?
-            return out[:,-1,:],enc_op
+            return out[:,-1,:],enc_src
         else: 
             src_mask = self.make_src_mask(src)
             trg_mask = self.make_trg_mask(trg)
@@ -320,6 +318,7 @@ class TransformerBlock(nn.Module):
     def forward(self,value,key,query,mask,srcType=None):
 
         attention = self.Attention.forward(value, key, query, mask)
+        
         x = self.dropout(self.l1(attention+query))
         y = self.feed_forward(x)
         out = self.dropout(self.l2(x+y))
@@ -813,14 +812,20 @@ if __name__ == '__main__':
     transfurmer= Transformer(src_vocab_size,trg_vocab_size,src_pad_idx,trg_pad_idx,max_src_size=300,max_trg_size=300,actionDim=7).to(
         device
     )
-    
+    transfurmer=transfurmer.float()
+
+    mseLoss = nn.MSELoss()
+    optimizer = torch.optim.Adam(transfurmer.parameters(),lr=1e-4)
+
     #TODO Logic for simulated action loop" 
     print("number of task inputs:",len(ep_lens_obj['language']['ann']))
     print("number of encoding outputs:",len(ep_lens_obj['language']['emb']))
     print("length of available tasks: ",len(ep_lens_obj['info']['indx']))
     #len(ep_lens_obj['language']['ann'])
     
-    for i in range(1): #len(ep_lens_obj['info']['indx'])
+    for i in range(len(ep_lens_obj['info']['indx'])): 
+        encLoss = 0
+        decLoss = 0
         print("episode ranges")
         start_index, end_index =(ep_lens_obj['info']['indx'][i])
         print(start_index,end_index)
@@ -831,28 +836,43 @@ if __name__ == '__main__':
         start_data = load(start_path)
         end_data=load(end_path)
         start_files = start_data.files
-        concatenated_op=torch.FloatTensor(1,episode_range+1,7)
+        concatenated_op=torch.FloatTensor(1,episode_range+1,7).to(torch.float32)
         curr_vision_ip = start_data['rgb_static']
-        curr_emb_op=ep_lens_obj['language']['emb'][i]
+        curr_emb_op=torch.from_numpy(ep_lens_obj['language']['emb'][i])
         curr_language_ip=ep_lens_obj['language']['ann'][i]
 
-        for j in range(episode_range+1):
+        for j in range(episode_range):
             curr_index=start_index+j
             curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index}.npz"
             curr_file=load(curr_path)
+            next_path = curr_path = f"C:/Project/DL_HW/dataset/calvin_debug_dataset/training/episode_0{curr_index+1}.npz"
+            next_file = load(next_path)
             curr_keys = curr_file.files
-            concatenated_op[0,j]=torch.from_numpy(curr_file['rel_actions'])
-
+            concatenated_op[0,j]=torch.from_numpy(curr_file['rel_actions']).to(torch.float32)
+            nextInput=torch.from_numpy(next_file['rel_actions']).to(torch.float32)
+            nextInput
             if j == 0:
                 firstImg=curr_file['rgb_static']
                 semantic_inference=sem_model.predict(firstImg)
                 x=transfurmer.MultiModalProjection(raw_text=curr_language_ip,raw_img=semantic_inference)
-                trg_output,enc_output=transfurmer.forward(x,concatenated_op)
+                trg_output,enc_output=transfurmer.forward(x,concatenated_op[:,:j+1,:])
+                enc_output = enc_output.squeeze(0)
+                trg_output = trg_output.squeeze(0)
+
             else:
-                output=transfurmer.forward(x,concatenated_op,enc_output)    
+                trg_output=transfurmer.forward(x,concatenated_op,enc_output)    
+                trg_output = trg_output.squeeze(0)
+            decLoss+=mseLoss(trg_output,nextInput)
+            encLoss+=mseLoss(enc_output,curr_emb_op)
             #compute loss of end
             #will use rel actions for learning
-        
+        loss = torch.Tensor(decLoss) + torch.Tensor(encLoss)
+        loss=loss.to(torch.float32)
+        print(f"loss:{loss} for {curr_language_ip}")
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
         print(curr_language_ip)
         print(concatenated_op.shape)
         #img need to be a 255x255
